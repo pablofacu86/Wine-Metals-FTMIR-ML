@@ -1,13 +1,36 @@
 # ======================================================================
 # PIPELINE SCAN REGRESSION
-# Estimacion cuantitativa de metales en vino a partir de espectros FT-MIR
-# (potasio, magnesio, calcio). Ver README para una descripcion completa
-# del flujo de trabajo, los datos de entrada y las salidas generadas.
+# Pipeline for the quantitative estimation of potassium, magnesium and calcium
+# in wine from FT-MIR spectra. See the README for a complete description of the
+# workflow, the input data and the generated outputs.
 # ======================================================================
 
 
 # ======================================
-# 0. Paralelización
+# PREPROCESSING SETTINGS
+# ======================================
+# SCATTER_FIRST: order of operations, always applied to the COMPLETE spectrum.
+#   TRUE  -> scatter correction (SNV/MSC) -> Savitzky-Golay (smoothing or derivative)
+#            SNV and MSC were designed for underived absorbance spectra.
+#   FALSE -> Savitzky-Golay -> SNV/MSC (alternative order).
+# SMOOTH_ALWAYS: if TRUE, combinations WITHOUT a derivative are also smoothed with
+#   Savitzky-Golay (derivative order 0, polynomial 3, 11-point window). If FALSE,
+#   they are left as unsmoothed spectra.
+SCATTER_FIRST <- TRUE
+SMOOTH_ALWAYS <- TRUE
+
+# Name of each combination (tables, plots and files). SG0 = smoothing only;
+# SG1 / SG2 = 1st / 2nd derivative. Techniques appear in the name in the order in
+# which they were applied (e.g. "SNV + SG1" = SNV followed by 1st derivative).
+make_pp_name <- function(sc, dv) {
+  sg      <- if (dv == 0 && !SMOOTH_ALWAYS) NULL else paste0("SG", dv)
+  sc_part <- if (sc == "none") NULL else sc
+  parts   <- if (SCATTER_FIRST) c(sc_part, sg) else c(sg, sc_part)
+  if (length(parts) == 0) "raw" else paste(parts, collapse = " + ")
+}
+
+# ======================================
+# 0. Parallelization
 # ======================================
 library(doParallel)
 num_cores <- parallel::detectCores() - 1
@@ -22,7 +45,7 @@ cat("CPU cores:", num_cores, "\n")
 cat(rep("=", 70), "\n\n", sep="")
 
 # ======================================
-# 1. Librerías
+# 1. Libraries
 # ======================================
 library(dplyr)
 library(tidyr)
@@ -41,63 +64,90 @@ library(ggrepel)
 library(ggnewscale)
 library(scales)
 
-# 🔧 FIX conflictos de margin
+# Resolve name conflict for the margin function
 margin <- ggplot2::margin
 
 # ======================================
-# CONFIGURACIÓN GLOBAL
+# GLOBAL SETTINGS
 # ======================================
-CONC_UNITS <- "mg/L"   # <── cambiar según el analito
+CONC_UNITS <- "mg/L"   # concentration units of the analyte
 
 # ======================================
-# 2. Directorios
+# 2. Directories
 # ======================================
 if (requireNamespace("rstudioapi", quietly = TRUE)) {
   setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 }
 
-dir.create("Resultados",               showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/Excel",         showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/Spectra",       showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/ScatterPlots",  showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/Heatmaps",      showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/Other",         showWarnings = FALSE, recursive = TRUE)
-dir.create("Resultados/Outliers",      showWarnings = FALSE, recursive = TRUE)
+dir.create("Results",               showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/Excel",         showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/Spectra",       showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/ScatterPlots",  showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/Heatmaps",      showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/Other",         showWarnings = FALSE, recursive = TRUE)
+dir.create("Results/Outliers",      showWarnings = FALSE, recursive = TRUE)
 
 cat(">>> Output folders created.\n\n")
 
 # ======================================
-# 3. Carga de datos
+# 3. Data loading
 # ======================================
 cat(">>> Loading data...\n")
 
-data_path <- "data/FINAL_DATA_SET.xlsx"      # <<< ruta al archivo de datos (ver README)
-sheet_name <- "MAGNESIO"   # <<< CAMBIAR a "POTASIO", "MAGNESIO" o "CALCIO" segun el analito a correr
-if (!file.exists(data_path)) stop("ERROR: File not found: ", data_path)
+data_path  <- "data/FINAL_DATA_SET.xlsx"      # path to the data file (see the README)
+sheet_name <- "MAGNESIUM"   # Analyte to run: "POTASSIUM", "MAGNESIUM" or "CALCIUM"
 
-nir <- read.xlsx(data_path, sheet = sheet_name)
+# Locates the data file regardless of the working directory and of whether the
+# name uses spaces or underscores ("FINAL DATA SET.xlsx" / "FINAL_DATA_SET.xlsx").
+locate_data_file <- function(preferred) {
+  if (file.exists(preferred)) return(preferred)
+  found <- list.files(".", pattern = "^FINAL[ _]DATA[ _]SET\\.xlsx$", recursive = TRUE,
+                      full.names = TRUE, ignore.case = TRUE)
+  if (length(found) > 0) return(found[1])
+  stop("ERROR: data file not found. Current directory: ", getwd(),
+       "\n  Copy 'FINAL_DATA_SET.xlsx' to that folder (or to 'data/') or adjust data_path.")
+}
+data_path <- locate_data_file(data_path)
+
+# Accepts sheet names in English or Spanish (and the 'COOPER' variant found in the dataset).
+resolve_sheet <- function(path, wanted) {
+  syn <- list(POTASSIUM = c("POTASSIUM", "POTASIO"), MAGNESIUM = c("MAGNESIUM", "MAGNESIO"),
+              CALCIUM   = c("CALCIUM", "CALCIO"),    IRON      = c("IRON", "HIERRO"),
+              COPPER    = c("COPPER", "COOPER", "COBRE"))
+  have <- getSheetNames(path)
+  key  <- names(syn)[vapply(syn, function(v) toupper(wanted) %in% v, logical(1))]
+  cand <- if (length(key) == 1) syn[[key]] else toupper(wanted)
+  hit  <- have[toupper(have) %in% cand]
+  if (length(hit) == 0)
+    stop("ERROR: sheet not found for '", wanted, "'. Available sheets: ", paste(have, collapse = ", "))
+  hit[1]
+}
+sheet_in_file <- resolve_sheet(data_path, sheet_name)
+cat("   Data file:", data_path, "| sheet:", sheet_in_file, "\n")
+
+nir <- read.xlsx(data_path, sheet = sheet_in_file)
 nir <- data.frame(lapply(nir, function(x)
   if (is.character(x)) as.factor(x) else x))
 
 sample_ids  <- as.character(nir[, 1])
 y_raw       <- nir[, 2]
-X_raw       <- nir[, -c(1, 2)]                     # espectro COMPLETO y continuo (hoja 1)
+X_raw       <- nir[, -c(1, 2)]                     # COMPLETE, continuous spectrum
 
 # --------------------------------------------------------------------
-# Helper: parsea numeros de onda desde nombres de columna tipo "X960.45"
-# O "X960,45" (coma decimal, formato regional de Excel/es-AR). Sin este
-# reemplazo, as.numeric("960,45") devuelve NA de forma silenciosa y
-# rompe patz_idx, el recorte post-preprocesamiento y los graficos con
-# lineas de Boruta. Se usa en TODO el pipeline en lugar de
-# as.numeric(gsub("X","",...)) suelto.
+# Helper: parses wavenumbers from column names such as "X960.45"
+# or "X960,45" (decimal comma, regional Excel format). Without this
+# replacement, as.numeric("960,45") silently returns NA and
+# breaks patz_idx, the post-preprocessing cropping and the plots with
+# Boruta lines. It is used throughout the pipeline instead of a bare
+# as.numeric(gsub("X","",...)).
 # --------------------------------------------------------------------
 parse_wn <- function(x) as.numeric(gsub(",", ".", gsub("X", "", x), fixed = TRUE))
 
 # --------------------------------------------------------------------
-# Helpers: formatean los hiperparametros optimizados de cada modelo
-# ganador (caret$bestTune, o la grilla elegida por CV manual en XGB)
-# como un string legible, para reportarlos junto con las metricas de
-# desempeno de cada combinacion.
+# Helpers: format the optimized hyperparameters of each winning model
+# (caret$bestTune, or the grid selected by manual CV in XGB)
+# as a readable string, so they can be reported together with the
+# performance metrics of each combination.
 # --------------------------------------------------------------------
 format_bestTune <- function(bt) {
   if (is.null(bt) || nrow(bt) == 0) return(NA_character_)
@@ -124,12 +174,9 @@ cat("   Spectral variables (full spectrum):", ncol(X_raw), "\n")
 cat("   Response range:", round(min(y_raw), 2), "-", round(max(y_raw), 2), "\n\n")
 
 # --------------------------------------------------------------------
-# Ventanas espectrales de Patz et al. (2004), retenidas para el modelado
-# (ver Seccion 2.3 del manuscrito). Se definen aqui para poder:
-#   (a) recortar el espectro DESPUES de suavizar/derivar (evita el
-#       artefacto de union entre ventanas no contiguas), y
-#   (b) mantener la deteccion de outliers sobre las 312 variables
-#       retenidas, tal como esta reportado en la Seccion 3.1.
+# Spectral windows from Patz et al. (2004), retained for modeling.
+# The spectrum is cropped AFTER smoothing/derivation, to avoid artifacts
+# at the junction of non-contiguous windows.
 # --------------------------------------------------------------------
 PATZ_WINDOWS <- list(c(965, 1582), c(1698, 2006), c(2701, 2971))
 in_patz_windows <- function(w) {
@@ -139,8 +186,8 @@ patz_idx <- in_patz_windows(wavelengths)
 cat("   Spectral variables within Patz windows:", sum(patz_idx), "\n\n")
 
 # ======================================
-# 4. Detección y eliminación de outliers
-#    (sobre las variables recortadas de Patz, consistente con 3.1)
+# 4. Outlier detection and removal
+#    (on the cropped Patz variables)
 # ======================================
 cat(">>> Outlier detection (Hotelling T2 AND Q residuals)...\n")
 
@@ -164,7 +211,7 @@ Q      <- rowSums((X_scaled - X_rec)^2)
 Q_lim  <- mean(Q) + 3 * sd(Q)
 flag_Q <- Q > Q_lim
 
-flag_outlier <- flag_T2 & flag_Q   # AND: solo outliers "graves" que incumplen AMBOS criterios a la vez
+flag_outlier <- flag_T2 & flag_Q   # AND: only "severe" outliers that violate BOTH criteria at once
 n_outliers   <- sum(flag_outlier)
 
 cat("   T2 flagged:", sum(flag_T2), "| Q flagged:", sum(flag_Q),
@@ -178,17 +225,17 @@ if (n_outliers > 0) {
     T2_score=round(T2[oidx],3),   T2_limit=round(T2_lim,3),   T2_flagged=flag_T2[oidx],
     Q_residual=round(Q[oidx],4),  Q_limit=round(Q_lim,4),     Q_flagged=flag_Q[oidx],
     Criterion="T2 > chi2(0.99) AND Q > mean+3SD", stringsAsFactors=FALSE),
-    file="Resultados/Outliers/Outliers_Removed.xlsx", overwrite=TRUE)
+    file="Results/Outliers/Outliers_Removed.xlsx", overwrite=TRUE)
   cat("   Removed:", paste(sample_ids[oidx], collapse=", "), "\n")
 } else {
   write.xlsx(data.frame(Message="No outliers detected - all samples retained.",
     T2_limit=round(T2_lim,3), Q_limit=round(Q_lim,4),
     Criterion="T2 AND Q", stringsAsFactors=FALSE),
-    file="Resultados/Outliers/Outliers_Removed.xlsx", overwrite=TRUE)
+    file="Results/Outliers/Outliers_Removed.xlsx", overwrite=TRUE)
   cat("   No outliers detected.\n")
 }
 
-# ── Espectros crudos ─────────────────────────────────────────────────
+# ── Raw spectra ─────────────────────────────────────────────────
 cat("   Plotting raw spectra...\n")
 raw_long <- data.frame(
   Wavenumber=rep(wavelengths, times=nrow(X_raw)),
@@ -221,8 +268,8 @@ if (n_outliers>0) {
                      size=3,box.padding=0.4,max.overlaps=20,
                      segment.color="#D7191C",segment.linewidth=0.4)
 }
-ggsave("Resultados/Outliers/Raw_Spectra_Outliers.png",p_raw,width=12,height=6,dpi=300,bg="white")
-cat("   ✓ Raw spectra saved\n")
+ggsave("Results/Outliers/Raw_Spectra_Outliers.png",p_raw,width=12,height=6,dpi=300,bg="white")
+cat("   OK Raw spectra saved\n")
 
 # ── PCA plots ────────────────────────────────────────────────────────
 pca_df <- data.frame(PC1=pca_exp$x[,1],PC2=pca_exp$x[,2],PC3=pca_exp$x[,3],
@@ -246,14 +293,14 @@ make_pca_plot <- function(df,xc,yc,xlab,ylab,title,fname) {
                label=paste0("Outliers removed: ",nrow(do)),
                hjust=0,vjust=1,color="red",fontface="bold",size=3.8)
   ggsave(fname,p,width=11,height=8,dpi=300,bg="white")
-  cat("   ✓ PCA saved:",basename(fname),"\n"); invisible(p)
+  cat("   OK PCA saved:",basename(fname),"\n"); invisible(p)
 }
 make_pca_plot(pca_df,"PC1","PC2",
               paste0("PC1 (",var_exp2[1],"%)"),paste0("PC2 (",var_exp2[2],"%)"),
-              "Exploratory PCA - PC1 vs PC2","Resultados/Outliers/PCA_PC1_vs_PC2.png")
+              "Exploratory PCA - PC1 vs PC2","Results/Outliers/PCA_PC1_vs_PC2.png")
 make_pca_plot(pca_df,"PC2","PC3",
               paste0("PC2 (",var_exp2[2],"%)"),paste0("PC3 (",var_exp2[3],"%)"),
-              "Exploratory PCA - PC2 vs PC3","Resultados/Outliers/PCA_PC2_vs_PC3.png")
+              "Exploratory PCA - PC2 vs PC3","Results/Outliers/PCA_PC2_vs_PC3.png")
 
 infl_df<-data.frame(T2=T2,Q=Q,Sample_ID=sample_ids,
                      Outlier=ifelse(flag_outlier,"Outlier","Normal"),stringsAsFactors=FALSE)
@@ -278,29 +325,20 @@ if(n_outliers>0)
     geom_label_repel(data=subset(infl_df,Outlier=="Outlier"),aes(label=Sample_ID),
                      color="red",fill="white",fontface="bold",
                      size=4.5,box.padding=0.4,max.overlaps=30)
-ggsave("Resultados/Outliers/Influence_Plot_T2_vs_Q.png",p_infl,width=11,height=8,dpi=300,bg="white")
-cat("   ✓ Influence plot saved\n")
+ggsave("Results/Outliers/Influence_Plot_T2_vs_Q.png",p_infl,width=11,height=8,dpi=300,bg="white")
+cat("   OK Influence plot saved\n")
 
 keep_idx<-!flag_outlier; X<-X_raw[keep_idx,,drop=FALSE]
 y<-y_raw[keep_idx]; sample_ids<-sample_ids[keep_idx]
 cat(sprintf("\n   After removal: %d samples (removed %d)\n\n",sum(keep_idx),n_outliers))
 
 # ======================================
-# 5. Train / Test Split (aleatorio estratificado)
+# 5. Train / Test Split (stratified random)
 # ======================================
-# Se vuelve al muestreo aleatorio estratificado (createDataPartition
-# sobre 5 bins de concentracion), despues de probar Kennard-Stone y
-# Duplex. Motivo: Kennard-Stone metia todas las muestras "extremas" en
-# training, dejando el test artificialmente facil (R2_Test > R2_Train).
-# Duplex corrigio esa asimetria, pero resulto DEMASIADO exigente para
-# este dataset (el R2_Test del mejor modelo bajo de ~0.94-0.95 a
-# ~0.87-0.88): al forzar que ambos sets cubran el mismo rango extremo
-# del espacio espectral, el test terminaba con casos igual de dificiles
-# que el training, castigando mucho la metrica. El muestreo aleatorio
-# estratificado por bins de concentracion es un termino medio razonable:
-# no genera el sesgo sistematico de Kennard-Stone (Test no le "gana"
-# al Training de forma estructural), y no es tan severo como Duplex.
-cat(">>> Splitting data (70/30, aleatorio estratificado por 5 bins de concentracion)...\n")
+# Stratified random sampling (createDataPartition) with a fixed seed.
+# Distance-based algorithms (Kennard-Stone, Duplex) are avoided, since they
+# concentrate the extreme samples in one of the two sets.
+cat(">>> Splitting data (70/30, stratified random sampling over 5 concentration bins)...\n")
 set.seed(1234)
 bins<-cut(y,breaks=5); idx<-createDataPartition(bins,p=0.7,list=FALSE)
 
@@ -308,43 +346,61 @@ X_train<-X[idx,]; X_test<-X[-idx,]; y_train<-y[idx]; y_test<-y[-idx]
 cat("   Train:",nrow(X_train),"| Test:",nrow(X_test),"\n\n")
 
 # ======================================
-# 6. Funciones de análisis
+# 6. Analysis functions
 # ======================================
 apply_preprocessing<-function(Xtr,Xte,ytr,yte,scatter,deriv){
   tryCatch({
     Xtr<-as.matrix(Xtr); Xte<-as.matrix(Xte)
     co<-colnames(Xtr); wo<-parse_wn(co)
 
-    # --- Suavizado (SG) y derivadas sobre el espectro COMPLETO y continuo ---
-    # Nota: Xtr/Xte llegan aqui con las 545 variables del espectro
-    # completo (902.57-3000.84 cm-1, sin huecos). Aplicar savitzkyGolay
-    # sobre esta matriz continua evita que la ventana movil de 11 puntos
-    # mezcle senal de regiones espectrales no contiguas, algo que SI
-    # ocurria cuando el suavizado se aplicaba directamente sobre las 312
-    # variables ya recortadas (con saltos artificiales de ~116 y ~698
-    # cm-1 entre las tres ventanas de Patz). Ver justificacion en
-    # Seccion 2.3 del manuscrito.
-    if(deriv>0){
-      Xtr<-savitzkyGolay(Xtr,m=deriv,p=3,w=11)
-      Xte<-savitzkyGolay(Xte,m=deriv,p=3,w=11)
-      if(ncol(Xtr)==length(co)){colnames(Xtr)<-co;colnames(Xte)<-co}
+    # --- Order of operations (SCATTER_FIRST / SMOOTH_ALWAYS switches) ---
+    # Everything is computed on the COMPLETE, continuous spectrum (545 variables, no
+    # gaps), so the 11-point Savitzky-Golay moving window does not mix signal
+    # from non-contiguous regions. Cropping to the Patz windows is done afterwards.
+    keep_names <- function(Xnew, cn) {
+      # Savitzky-Golay may trim (w-1)/2 columns at each edge; the remaining
+      # columns are the central ones, so they are named by position.
+      if (is.null(cn) || ncol(Xnew) == 0) return(Xnew)
+      d <- length(cn) - ncol(Xnew)
+      if (d >= 0 && d %% 2 == 0) colnames(Xnew) <- cn[(d / 2 + 1):(d / 2 + ncol(Xnew))]
+      Xnew
     }
-    if(scatter=="SNV"){Xtr<-standardNormalVariate(Xtr);Xte<-standardNormalVariate(Xte)}
-    if(scatter=="MSC"){
-      ref<-colMeans(Xtr,na.rm=TRUE)
-      mf<-function(r){if(all(is.na(r)))return(r);fit<-lm(r~ref);(r-coef(fit)[1])/coef(fit)[2]}
-      Xtr<-t(apply(Xtr,1,mf));Xte<-t(apply(Xte,1,mf))
+    sg_step <- function(Xa, Xb) {
+      if (deriv > 0 || SMOOTH_ALWAYS) {
+        cn <- colnames(Xa)
+        Xa <- savitzkyGolay(Xa, m = deriv, p = 3, w = 11)
+        Xb <- savitzkyGolay(Xb, m = deriv, p = 3, w = 11)
+        Xa <- keep_names(Xa, cn); Xb <- keep_names(Xb, cn)
+      }
+      list(Xa, Xb)
     }
+    scatter_step <- function(Xa, Xb) {
+      cn <- colnames(Xa)
+      if (scatter == "SNV") { Xa <- standardNormalVariate(Xa); Xb <- standardNormalVariate(Xb) }
+      if (scatter == "MSC") {
+        ref <- colMeans(Xa, na.rm = TRUE)   # reference: mean of the TRAINING set
+        mf  <- function(r) { if (all(is.na(r))) return(r); fit <- lm(r ~ ref); (r - coef(fit)[1]) / coef(fit)[2] }
+        Xa <- t(apply(Xa, 1, mf)); Xb <- t(apply(Xb, 1, mf))
+      }
+      if (!is.null(cn) && ncol(Xa) == length(cn)) { colnames(Xa) <- cn; colnames(Xb) <- cn }
+      list(Xa, Xb)
+    }
+    if (SCATTER_FIRST) {
+      s1 <- scatter_step(Xtr, Xte); s2 <- sg_step(s1[[1]], s1[[2]])
+    } else {
+      s1 <- sg_step(Xtr, Xte);      s2 <- scatter_step(s1[[1]], s1[[2]])
+    }
+    Xtr <- s2[[1]]; Xte <- s2[[2]]
 
-    # --- Recorte a las ventanas de Patz DESPUES del suavizado/derivada ---
+    # --- Crop to the Patz windows AFTER smoothing/derivative/scatter correction ---
     co2<-colnames(Xtr); wo2<-suppressWarnings(parse_wn(co2))
-    if(length(wo2)==0 || all(is.na(wo2))) wo2<-wo   # fallback si se perdieran los nombres
+    if(length(wo2)==0 || all(is.na(wo2))) wo2<-wo   # fallback in case the names were lost
     keep_patz<-in_patz_windows(wo2)
     Xtr<-Xtr[,keep_patz,drop=FALSE]; Xte<-Xte[,keep_patz,drop=FALSE]
     wo2<-wo2[keep_patz]
 
     mu<-colMeans(Xtr,na.rm=TRUE)
-    Xtr_plot<-Xtr; Xte_plot<-Xte   # <- version SIN centrar, solo para graficos de diagnostico
+    Xtr_plot<-Xtr; Xte_plot<-Xte   # <- UNcentered version, only for diagnostic plots
     Xtr<-sweep(Xtr,2,mu,"-");Xte<-sweep(Xte,2,mu,"-")
     ktr<-complete.cases(Xtr);kte<-complete.cases(Xte)
     vv<-apply(Xtr[ktr,,drop=FALSE],2,var,na.rm=TRUE);kc<-!is.na(vv)&vv>1e-10
@@ -378,7 +434,7 @@ plot_spectra<-function(Xm,wl,title,sel_vars=NULL,pp_name){
                  label=paste0(length(sw)," variables selected"),
                  hjust=0,vjust=1,color="red",size=5,fontface="bold")
   }
-  fn<-paste0("Resultados/Spectra/",gsub(" ","_",pp_name),
+  fn<-paste0("Results/Spectra/",gsub(" ","_",pp_name),
               ifelse(is.null(sel_vars),"","_Boruta"),".png")
   tryCatch(ggsave(fn,p,width=10,height=6,dpi=300,bg="white"),error=function(e)NULL)
   invisible(p)
@@ -421,22 +477,22 @@ plot_predictions<-function(model,train_data,test_data,model_name,pp_name,boruta_
             axis.title=element_text(size=15),axis.text=element_text(size=13),
             legend.text=element_text(size=13),legend.title=element_text(size=14),
             legend.position="top")+coord_fixed()
-    dir.create(paste0("Resultados/ScatterPlots/",model_name),showWarnings=FALSE,recursive=TRUE)
-    fn<-paste0("Resultados/ScatterPlots/",model_name,"/",
+    dir.create(paste0("Results/ScatterPlots/",model_name),showWarnings=FALSE,recursive=TRUE)
+    fn<-paste0("Results/ScatterPlots/",model_name,"/",
                gsub(" ","_",pp_name),"_",boruta_status,".png")
     ggsave(fn,p,width=8,height=8,dpi=300,bg="white");return(TRUE)
   },error=function(e){cat("   ERROR scatter:",e$message,"\n");return(FALSE)})
 }
 
 # ======================================================
-# HEATMAP TIPO 1: facet_grid (hm1 y hm2)
+# HEATMAP TYPE 1: facet_grid (hm1 and hm2)
 #
-# Clave del fix: se usa pivot_longer para crear
-# una tabla larga con columnas (x_col, Model, Metric, Value)
-# y se pasa Metric al eje Y dentro de cada faceta.
-# facet_grid(Model ~ .) agrupa las 3 filas de métrica
-# bajo cada panel de modelo. Las leyendas son
-# guide_colorbar nativos de ggplot con ggnewscale.
+# pivot_longer is used to create
+# a long table with columns (x_col, Model, Metric, Value)
+# and Metric is mapped to the Y axis within each facet.
+# facet_grid(Model ~ .) groups the 3 metric rows
+# under each model panel. The legends are
+# native ggplot guide_colorbar objects, combined with ggnewscale.
 # ======================================================
 make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
                                 title, subtitle, filename,
@@ -453,8 +509,8 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
   lbl_rpd  <- "RPD Test"
   lbl_r2   <- "R\u00b2 Test"
 
-  # Tabla larga: una fila por (x_col, Model, Metric)
-  # El eje Y = Metric, el facet = Model (o y_var)
+  # Long table: one row per (x_col, Model, Metric)
+  # Y axis = Metric, facet = Model (or y_var)
   df_long <- df_wide %>%
     rename(x_col = !!sym(x_var), Model = !!sym(y_var)) %>%
     pivot_longer(cols = c(RMSE_Test, RPD_Test, R2_Test),
@@ -464,7 +520,7 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
       case_when(metric_id == "RMSE_Test" ~ lbl_rmse,
                 metric_id == "RPD_Test"  ~ lbl_rpd,
                 metric_id == "R2_Test"   ~ lbl_r2),
-      levels = c(lbl_rmse, lbl_rpd, lbl_r2)   # orden: RMSE arriba, R2 abajo
+      levels = c(lbl_rmse, lbl_rpd, lbl_r2)   # order: RMSE on top, R2 at the bottom
     ))
 
   d_rmse <- filter(df_long, metric_id == "RMSE_Test")
@@ -473,7 +529,7 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
 
   p <- ggplot() +
 
-    # ── RMSE (verde=bajo, rojo=alto) ──────────────────────────────
+    # ── RMSE (green=low, red=high) ──────────────────────────────
     geom_tile(data=d_rmse, aes(x=x_col, y=Metric, fill=Value),
               color="white", linewidth=0.5) +
     geom_text(data=d_rmse, aes(x=x_col, y=Metric, label=round(Value,2)),
@@ -492,7 +548,7 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
     ) +
     new_scale_fill() +
 
-    # ── RPD (rojo=bajo, verde=alto) ───────────────────────────────
+    # ── RPD (red=low, green=high) ───────────────────────────────
     geom_tile(data=d_rpd, aes(x=x_col, y=Metric, fill=Value),
               color="white", linewidth=0.5) +
     geom_text(data=d_rpd, aes(x=x_col, y=Metric, label=round(Value,2)),
@@ -511,7 +567,7 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
     ) +
     new_scale_fill() +
 
-    # ── R² (rojo=bajo, verde=alto) ────────────────────────────────
+    # ── R² (red=low, green=high) ────────────────────────────────
     geom_tile(data=d_r2, aes(x=x_col, y=Metric, fill=Value),
               color="white", linewidth=0.5) +
     geom_text(data=d_r2, aes(x=x_col, y=Metric, label=round(Value,3)),
@@ -529,7 +585,7 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
         order=1)
     ) +
 
-    # facet_grid: Model en filas, las 3 métricas son el eje Y de cada panel
+    # facet_grid: Model in rows, the 3 metrics are the Y axis of each panel
     facet_grid(rows   = vars(Model),
                scales = "free_y",
                space  = "free_y",
@@ -562,15 +618,15 @@ make_heatmap_facet <- function(df_wide, x_var, y_var="Model",
     )
 
   ggsave(filename, p, width=width, height=height, dpi=300,bg="white")
-  cat("   ✓ Heatmap saved:", basename(filename), "\n")
+  cat("   OK Heatmap saved:", basename(filename), "\n")
   invisible(p)
 }
 
 # ======================================================
-# HEATMAP TIPO 2: tabla simple (hm3 y hm4)
-# Filas = modelos/preprocessing
-# Columnas = las 3 métricas (RMSE, RPD, R²)
-# Una escala independiente por métrica via ggnewscale
+# HEATMAP TYPE 2: simple table (hm3 and hm4)
+# Rows = models/preprocessing
+# Columns = the 3 metrics (RMSE, RPD, R²)
+# One independent scale per metric via ggnewscale
 # ======================================================
 make_heatmap_simple <- function(df_wide, row_var,
                                  title, subtitle, filename,
@@ -678,18 +734,18 @@ make_heatmap_simple <- function(df_wide, row_var,
     )
 
   ggsave(filename, p, width=width, height=height, dpi=300,bg="white")
-  cat("   ✓ Heatmap saved:", basename(filename), "\n")
+  cat("   OK Heatmap saved:", basename(filename), "\n")
   invisible(p)
 }
 
 # ======================================
-# 7. Modelos
+# 7. Models
 # ======================================
 ctrl <- trainControl(method="cv", number=5, allowParallel=TRUE, verboseIter=FALSE)
 
-# XGB se excluye de la lista models y se maneja con implementación directa
-# (igual que en el pipeline de clasificación) porque caret + doParallel +
-# xgboost genera "Error: Stopping" por conflicto de forks con OpenMP.
+# XGB is excluded from the models list and handled with a direct implementation
+# (as in the classification pipeline) because caret + doParallel +
+# xgboost raises "Error: Stopping" due to a fork conflict with OpenMP.
 models <- list(
   PLS = function(tr) { set.seed(123)
     train(Grupo~.,data=tr,method="pls",trControl=ctrl,tuneLength=15,metric="RMSE") },
@@ -711,10 +767,10 @@ models <- list(
           tuneLength=6,ntree=300,metric="RMSE") }
 )
 
-# ── XGB directo para REGRESIÓN (sin caret, sin doParallel) ──────────────
-# Misma estrategia que el pipeline de clasificación:
-# xgb.train() puro + CV manual 5-fold + nthread=1.
-# Evita completamente el conflicto OpenMP/fork que causa "Error: Stopping".
+# ── Direct XGB for REGRESSION (no caret, no doParallel) ──────────────
+# Same strategy as in the classification pipeline:
+# plain xgb.train() + manual 5-fold CV + nthread=1.
+# Completely avoids the OpenMP/fork conflict that causes "Error: Stopping".
 train_xgb_direct <- function(tr) {
   set.seed(123)
 
@@ -748,7 +804,7 @@ train_xgb_direct <- function(tr) {
       colsample_bytree = grid$colsample_bytree[i],
       min_child_weight = grid$min_child_weight[i],
       subsample        = grid$subsample[i],
-      nthread          = 1,   # <── clave: sin paralelismo interno de xgboost
+      nthread          = 1,   # no internal xgboost parallelism
       verbosity        = 0
     )
 
@@ -783,7 +839,7 @@ train_xgb_direct <- function(tr) {
   list(model=final_model, cv_rmse=best_rmse, best_params=best_params)
 }
 
-# Predicción para XGB directo (regresión)
+# Prediction for direct XGB (regression)
 predict_xgb_reg <- function(xgb_obj, newdata_df) {
   X_mat <- as.matrix(newdata_df[, setdiff(names(newdata_df), "Grupo")])
   dmat  <- xgb.DMatrix(data = X_mat)
@@ -791,7 +847,7 @@ predict_xgb_reg <- function(xgb_obj, newdata_df) {
 }
 
 # ======================================
-# 8. Configuración experimental
+# 8. Experimental setup
 # ======================================
 scatter_opts <- c("none","SNV","MSC")
 deriv_opts   <- c(0,1,2)
@@ -799,8 +855,8 @@ boruta_opts  <- c("none","boruta")
 
 results_all     <- list()
 error_log       <- list()
-boruta_vars_log <- list()   # registro de variables seleccionadas por Boruta
-inicio_ejecucion <- Sys.time()
+boruta_vars_log <- list()   # log of the variables selected by Boruta
+start_time <- Sys.time()
 
 cat("\n>>> EXPERIMENT CONFIGURATION:\n")
 cat("   Preprocessing methods:",length(scatter_opts)*length(deriv_opts),"\n")
@@ -811,15 +867,14 @@ cat("   TOTAL COMBINATIONS:",
 cat("   Estimated time: ~1-3 hours\n\n")
 
 # ======================================
-# 9. Loop principal
+# 9. Main loop
 # ======================================
 total_runs  <- length(scatter_opts)*length(deriv_opts)*length(boruta_opts)*(length(models)+1)
 current_run <- 0
 
 for (sc in scatter_opts) {
   for (dv in deriv_opts) {
-    pp_name<-trimws(gsub(" +"," ",paste(
-      "SG",ifelse(sc=="none","",sc),ifelse(dv==0,"",paste0("+",dv,"der")))))
+    pp_name<-make_pp_name(sc, dv)
     cat("\n>>> Preprocessing:",pp_name,"\n")
     pp<-apply_preprocessing(X_train,X_test,y_train,y_test,sc,dv)
     if(!pp$success){cat("   ERROR:",pp$error,"\n")
@@ -836,7 +891,7 @@ for (sc in scatter_opts) {
           bor<-Boruta(Grupo~.,train_base,maxRuns=500,doTrace=0)
           n_tentative<-sum(bor$finalDecision=="Tentative")
           if(n_tentative>0){
-            cat("   ",n_tentative,"variable(s) Tentative -> resolviendo con TentativeRoughFix...\n")
+            cat("   ",n_tentative,"variable(s) Tentative -> resolving with TentativeRoughFix...\n")
             bor<-TentativeRoughFix(bor)
           }
           vars<-names(bor$finalDecision[bor$finalDecision=="Confirmed"])
@@ -848,7 +903,7 @@ for (sc in scatter_opts) {
         if(!bor_res$success){
           error_log[[length(error_log)+1]]<-list(
             step=paste(pp_name,"Boruta"),error=bor_res$error);next}
-        # Guardar registro de variables seleccionadas para el informe
+        # Save the log of selected variables for the report
         boruta_vars_log[[paste(pp_name,"boruta",sep="__")]] <- list(
           Preprocessing = pp_name,
           N_selected    = length(bor_res$vars),
@@ -863,7 +918,7 @@ for (sc in scatter_opts) {
         }
       }
 
-      # ── Modelos caret (PLS, SVM, Ridge, Lasso, ElasticNet, RF) ──────
+      # ── caret models (PLS, SVM, Ridge, Lasso, ElasticNet, RF) ──────
       for (m in names(models)) {
         current_run <- current_run + 1
         cat("   [",current_run,"/",total_runs,"] Model:",m,"\n")
@@ -887,30 +942,30 @@ for (sc in scatter_opts) {
         }
       }
 
-      # ── XGBoost directo (xgb.train, sin caret, sin doParallel) ──────
-      # Se corre FUERA del cluster paralelo para evitar el conflicto
-      # OpenMP/fork que genera "Error: Stopping" con xgbTree en caret.
+      # ── Direct XGBoost (xgb.train, no caret, no doParallel) ──────
+      # Run OUTSIDE the parallel cluster to avoid the OpenMP/fork
+      # conflict that causes "Error: Stopping" with xgbTree in caret.
       current_run <- current_run + 1
       cat("   [",current_run,"/",total_runs,"] Model: XGB (direct xgb.train)\n")
 
       xgb_res <- tryCatch({
 
-        # 1. Entrenar
+        # 1. Train
         xgb_obj <- train_xgb_direct(train_base)
 
-        # 2. Predicciones
+        # 2. Predictions
         pt <- predict_xgb_reg(xgb_obj, train_base)
         pe <- predict_xgb_reg(xgb_obj, test_base)
         yt <- train_base$Grupo
         ye <- test_base$Grupo
 
-        # 3. Métricas
+        # 3. Metrics
         r2_tr  <- caret::R2(pt, yt);   rmse_tr <- caret::RMSE(pt, yt)
         rpd_tr <- sd(yt) / rmse_tr
         r2_te  <- caret::R2(pe, ye);   rmse_te <- caret::RMSE(pe, ye)
         rpd_te <- sd(ye) / rmse_te
 
-        # 4. Scatter plot — misma estética que plot_predictions()
+        # 4. Scatter plot — same style as plot_predictions()
         pd <- data.frame(
           Real      = c(yt, ye),
           Predicted = c(pt, pe),
@@ -944,8 +999,8 @@ for (sc in scatter_opts) {
                 legend.position="top") +
           coord_fixed()
 
-        dir.create("Resultados/ScatterPlots/XGB", showWarnings=FALSE, recursive=TRUE)
-        fn_sc <- paste0("Resultados/ScatterPlots/XGB/",
+        dir.create("Results/ScatterPlots/XGB", showWarnings=FALSE, recursive=TRUE)
+        fn_sc <- paste0("Results/ScatterPlots/XGB/",
                         gsub(" ","_", pp_name), "_", sel, ".png")
         ggsave(fn_sc, p_sc, width=8, height=8, dpi=300,bg="white")
 
@@ -975,20 +1030,20 @@ for (sc in scatter_opts) {
 }      # end scatter loop
 
 # ======================================
-# 10. Exportar resultados y gráficos
+# 10. Export results and plots
 # ======================================
 if(length(results_all)>0){
   results_df<-bind_rows(results_all)
-  write.xlsx(results_df,"Resultados/Excel/Complete_Summary.xlsx",overwrite=TRUE)
-  cat("\n✓ Results exported:",nrow(results_df),"rows\n")
+  write.xlsx(results_df,"Results/Excel/Complete_Summary.xlsx",overwrite=TRUE)
+  cat("\nOK Results exported:",nrow(results_df),"rows\n")
 
   cat("\n=== TOP 10 (R2 Test) ===\n")
   print(results_df %>% arrange(desc(R2_Test)) %>% head(10) %>%
         select(Model,Preprocessing,Boruta,N_vars,R2_Test,RMSE_Test,RPD_Test))
 
   # ────────────────────────────────────────────────────────────────
-  # 9bis. Exportar hiperparametros optimizados de los top 10 modelos
-  # (por R2_Test) a Excel, junto con sus metricas.
+  # Export the optimized hyperparameters of the top 10 models
+  # (by R2_Test) to Excel, together with their metrics.
   # ────────────────────────────────────────────────────────────────
   top10_hp <- results_df %>%
     arrange(desc(R2_Test)) %>%
@@ -996,18 +1051,18 @@ if(length(results_all)>0){
     mutate(Rank = row_number(), .before = 1) %>%
     select(Rank, Model, Preprocessing, Boruta, N_vars, Hyperparameters,
            R2_Test, RMSE_Test, RPD_Test, R2_Train, RMSE_Train, RPD_Train)
-  write.xlsx(top10_hp, "Resultados/Excel/Top10_Hyperparameters.xlsx", overwrite = TRUE)
-  cat("   ✓ Saved: Top10_Hyperparameters.xlsx\n")
+  write.xlsx(top10_hp, "Results/Excel/Top10_Hyperparameters.xlsx", overwrite = TRUE)
+  cat("   OK Saved: Top10_Hyperparameters.xlsx\n")
 
   # ────────────────────────────────────────────────────────────────
-  # 10bis. Exportar variables seleccionadas por Boruta a Excel
-  #   (a) Todas las combinaciones Preprocesamiento x Boruta, una fila
-  #       por combinacion, con la lista completa de numeros de onda
-  #       seleccionados -> para ver el efecto global de Boruta.
-  #   (b) Solo la combinacion del MODELO GANADOR (menor RMSE_Test
-  #       entre las filas con Boruta=="boruta"), en formato largo
-  #       (un numero de onda por fila) para poder cruzarla despues
-  #       con los grupos funcionales del EDTA.
+  # Export the variables selected by Boruta to Excel
+  #   (a) All Preprocessing x Boruta combinations, one row
+  #       per combination, with the full list of selected
+  #       wavenumbers -> to see the overall effect of Boruta.
+  #   (b) Only the combination of the WINNING MODEL (lowest RMSE_Test
+  #       among the rows with Boruta=="boruta"), in long format
+  #       (one wavenumber per row) so that it can later be cross-referenced
+  #       with the functional groups of EDTA.
   # ────────────────────────────────────────────────────────────────
   if (length(boruta_vars_log) > 0) {
     cat("\n>>> Exporting Boruta variable selection to Excel...\n")
@@ -1024,9 +1079,9 @@ if(length(results_all)>0){
         stringsAsFactors = FALSE)
     }))
     write.xlsx(bvl_all_df,
-               "Resultados/Excel/Boruta_Variables_All_Preprocessing.xlsx",
+               "Results/Excel/Boruta_Variables_All_Preprocessing.xlsx",
                overwrite = TRUE)
-    cat("   ✓ Saved: Boruta_Variables_All_Preprocessing.xlsx (",
+    cat("   OK Saved: Boruta_Variables_All_Preprocessing.xlsx (",
         nrow(bvl_all_df), "preprocessing combinations )\n")
 
     best_boruta_row <- results_df %>%
@@ -1053,9 +1108,9 @@ if(length(results_all)>0){
           RPD_Test        = round(best_boruta_row$RPD_Test, 2))
 
         write.xlsx(best_vars_df,
-                   "Resultados/Excel/Boruta_Variables_Best_Model.xlsx",
+                   "Results/Excel/Boruta_Variables_Best_Model.xlsx",
                    overwrite = TRUE)
-        cat("   ✓ Saved: Boruta_Variables_Best_Model.xlsx  (Model:",
+        cat("   OK Saved: Boruta_Variables_Best_Model.xlsx  (Model:",
             best_boruta_row$Model, "| Preprocessing:", best_boruta_row$Preprocessing,
             "|", length(best_vars_wn), "wavenumbers )\n")
       } else {
@@ -1074,42 +1129,42 @@ if(length(results_all)>0){
 
   cat("\n>>> Generating heatmaps...\n")
 
-  # HM1: facet — Modelo × Preprocesamiento
+  # HM1: facet — Model × Preprocessing
   hm1<-results_df %>% group_by(Model,Preprocessing) %>%
     summarise(R2_Test=mean(R2_Test,na.rm=TRUE),RMSE_Test=mean(RMSE_Test,na.rm=TRUE),
               RPD_Test=mean(RPD_Test,na.rm=TRUE),.groups="drop")
   make_heatmap_facet(hm1,"Preprocessing","Model",
     "Performance Metrics (Test) \u2014 Model vs Preprocessing",
-    subtitle_hm,"Resultados/Heatmaps/Metrics_Model_Preprocessing.png",width=14,height=11)
+    subtitle_hm,"Results/Heatmaps/Metrics_Model_Preprocessing.png",width=14,height=11)
 
-  # HM2: facet — Modelo × Config (Preprocessing + Boruta)
+  # HM2: facet — Model × Config (Preprocessing + Boruta)
   hm2<-results_df %>% mutate(Config=paste(Preprocessing,Boruta,sep="\n")) %>%
     group_by(Model,Config) %>%
     summarise(R2_Test=mean(R2_Test,na.rm=TRUE),RMSE_Test=mean(RMSE_Test,na.rm=TRUE),
               RPD_Test=mean(RPD_Test,na.rm=TRUE),.groups="drop")
   make_heatmap_facet(hm2,"Config","Model",
     "Performance Metrics (Test) \u2014 Model vs Preprocessing + Boruta",
-    subtitle_hm,"Resultados/Heatmaps/Metrics_Model_Boruta.png",width=22,height=11)
+    subtitle_hm,"Results/Heatmaps/Metrics_Model_Boruta.png",width=22,height=11)
 
-  # HM3: simple — promedio por Modelo (filas=modelos, cols=3 métricas)
+  # HM3: simple — average by Model (rows=models, cols=3 metrics)
   hm3<-results_df %>% group_by(Model) %>%
     summarise(R2_Test=mean(R2_Test,na.rm=TRUE),RMSE_Test=mean(RMSE_Test,na.rm=TRUE),
               RPD_Test=mean(RPD_Test,na.rm=TRUE),.groups="drop")
   make_heatmap_simple(hm3,"Model",
     "Performance Metrics (Test) \u2014 Average by Model",
     "Average across all preprocessing methods and Boruta options",
-    "Resultados/Heatmaps/Metrics_by_Model.png",width=9,height=6)
+    "Results/Heatmaps/Metrics_by_Model.png",width=9,height=6)
 
-  # HM4: simple — promedio por Preprocesamiento (filas=prep, cols=3 métricas)
+  # HM4: simple — average by Preprocessing (rows=preprocessing, cols=3 metrics)
   hm4<-results_df %>% group_by(Preprocessing) %>%
     summarise(R2_Test=mean(R2_Test,na.rm=TRUE),RMSE_Test=mean(RMSE_Test,na.rm=TRUE),
               RPD_Test=mean(RPD_Test,na.rm=TRUE),.groups="drop")
   make_heatmap_simple(hm4,"Preprocessing",
     "Performance Metrics (Test) \u2014 Average by Preprocessing",
     "Average across all models and Boruta options",
-    "Resultados/Heatmaps/Metrics_by_Preprocessing.png",width=9,height=7)
+    "Results/Heatmaps/Metrics_by_Preprocessing.png",width=9,height=7)
 
-  # HM5: RMSE solo
+  # HM5: RMSE only
   hm5<-results_df %>% group_by(Model,Preprocessing) %>%
     summarise(RMSE_Test=mean(RMSE_Test,na.rm=TRUE),.groups="drop")
   q33s<-quantile(hm5$RMSE_Test,1/3); q66s<-quantile(hm5$RMSE_Test,2/3)
@@ -1127,8 +1182,8 @@ if(length(results_all)>0){
     theme(plot.title=element_text(face="bold",hjust=0.5,size=13),
           plot.subtitle=element_text(hjust=0.5,size=9,color="gray40"),
           axis.text.x=element_text(angle=45,hjust=1),panel.grid=element_blank())
-  ggsave("Resultados/Heatmaps/RMSE_Model_Preprocessing.png",p_hm5,width=12,height=8,dpi=300,bg="white")
-  cat("   ✓ RMSE-only heatmap saved\n")
+  ggsave("Results/Heatmaps/RMSE_Model_Preprocessing.png",p_hm5,width=12,height=8,dpi=300,bg="white")
+  cat("   OK RMSE-only heatmap saved\n")
 
   # Model Comparison
   preproc_pal<-setNames(
@@ -1155,10 +1210,10 @@ if(length(results_all)>0){
           plot.subtitle=element_text(hjust=0.5,size=9,color="gray40"),
           axis.text.x=element_text(angle=45,hjust=1),
           legend.position="right",panel.grid.major.x=element_blank())
-  ggsave("Resultados/Other/Model_Comparison.png",p_comp,width=13,height=7,dpi=300,bg="white")
-  cat("   ✓ Model comparison saved\n")
+  ggsave("Results/Other/Model_Comparison.png",p_comp,width=13,height=7,dpi=300,bg="white")
+  cat("   OK Model comparison saved\n")
 
-  # PCA métricas
+  # Metrics PCA
   cat("\n>>> Generating PCA of metrics...\n")
   pca_data  <-results_df %>%
     select(R2_Train,RMSE_Train,RPD_Train,R2_Test,RMSE_Test,RPD_Test) %>% scale()
@@ -1181,14 +1236,14 @@ if(length(results_all)>0){
     theme(plot.title=element_text(face="bold",hjust=0.5,size=14),
           plot.subtitle=element_text(hjust=0.5,size=10),
           legend.position="right",panel.border=element_rect(color="gray50",fill=NA))
-  ggsave("Resultados/Other/PCA_Metrics.png",p_pca,width=14,height=8,dpi=300,bg="white")
+  ggsave("Results/Other/PCA_Metrics.png",p_pca,width=14,height=8,dpi=300,bg="white")
   ld<-as.data.frame(pca_result$rotation[,1:2]);ld$Variable<-rownames(ld)
   write.xlsx(list("Scores"=pca_scores,"Loadings"=ld,
                   "Variance_Explained"=data.frame(
                     Component=paste0("PC",seq_along(pca_result$sdev)),
                     Var_Explained=summary(pca_result)$importance[2,]*100,
                     Cumulative   =summary(pca_result)$importance[3,]*100)),
-             "Resultados/Excel/PCA_Analysis.xlsx",overwrite=TRUE)
+             "Results/Excel/PCA_Analysis.xlsx",overwrite=TRUE)
 
   # Ranking
   cat("\n>>> Generating ranking...\n")
@@ -1210,15 +1265,15 @@ if(length(results_all)>0){
               RPD_Test=mean(RPD_Test),.groups="drop")
 
   # ======================================
-  # 6bis. Test t pareado: efecto de Boruta
-  #   Comentario de M. Palma: valorar el efecto de Boruta con un test
-  #   estadistico formal en vez de solo comparar medias. Se usa un test t
-  #   pareado (no independiente) porque, para cada combinacion Modelo x
-  #   Preprocesamiento, la version "Boruta" y la version "None" provienen
-  #   de las MISMAS muestras de vino evaluadas con y sin seleccion de
-  #   variables -> son observaciones emparejadas, no independientes.
-  #   Se usa una cola (alternative) porque la hipotesis a testear es
-  #   direccional: "Boruta mejora el rendimiento", no solo "lo cambia".
+  # Paired t-test: effect of Boruta
+  #   To assess the effect of Boruta, a formal statistical test is used
+  #   instead of only comparing means. A paired t-test is
+  #   used (not an independent one) because, for each Model x
+  #   Preprocessing combination, the "Boruta" and "None" versions come from
+  #   the SAME wine samples evaluated with and without variable
+  #   selection -> they are paired, not independent observations.
+  #   A one-tailed test (alternative) is used because the hypothesis is
+  #   directional: "Boruta improves performance", not just "changes it".
   # ======================================
   cat("\n>>> Paired t-test: Boruta effect...\n")
   boruta_lv <- sort(unique(results_df$Boruta))
@@ -1236,9 +1291,9 @@ if(length(results_all)>0){
     w_r2   <- wide_metric("R2_Test")
     w_rpd  <- wide_metric("RPD_Test")
 
-    # Se descartan pares con NA en alguno de los dos brazos (combinaciones
-    # que fallaron en uno de los dos escenarios), y se registra cuantos
-    # pares completos quedan disponibles para el test.
+    # Pairs with NA in either arm are dropped (combinations
+    # that failed in one of the two scenarios), and the number of
+    # complete pairs available for the test is recorded.
     ok_rmse <- complete.cases(w_rmse[,c(bor_lab,none_lab)])
     ok_r2   <- complete.cases(w_r2[,c(bor_lab,none_lab)])
     ok_rpd  <- complete.cases(w_rpd[,c(bor_lab,none_lab)])
@@ -1259,26 +1314,26 @@ if(length(results_all)>0){
       t_statistic      = c(unname(pt_rmse$statistic), unname(pt_r2$statistic), unname(pt_rpd$statistic)),
       df               = c(unname(pt_rmse$parameter), unname(pt_r2$parameter), unname(pt_rpd$parameter)),
       p_value_one_tail = c(pt_rmse$p.value, pt_r2$p.value, pt_rpd$p.value),
-      H1               = c("RMSE menor con Boruta","R2 mayor con Boruta","RPD mayor con Boruta"),
+      H1               = c("RMSE lower with Boruta","R2 higher with Boruta","RPD higher with Boruta"),
       Significant_0.05 = c(pt_rmse$p.value, pt_r2$p.value, pt_rpd$p.value) < 0.05,
       stringsAsFactors = FALSE)
 
-    # p bilateral: el test de una cola solo evalua 'Boruta mejora'; si Boruta EMPEORA
-    # significativamente (p una cola cercano a 1), este p bilateral lo hace visible.
+    # two-sided p: the one-tailed test only evaluates 'Boruta improves'; if Boruta
+    # significantly WORSENS performance (one-tailed p close to 1), this two-sided p shows it.
     boruta_ttest_df$p_value_two_sided <- 2 * pt(-abs(boruta_ttest_df$t_statistic), boruta_ttest_df$df)
-    write.xlsx(boruta_ttest_df, "Resultados/Excel/Boruta_Paired_Ttest.xlsx", overwrite=TRUE)
-    cat("   ✓ Paired t-test exported to Resultados/Excel/Boruta_Paired_Ttest.xlsx\n")
+    write.xlsx(boruta_ttest_df, "Results/Excel/Boruta_Paired_Ttest.xlsx", overwrite=TRUE)
+    cat("   OK Paired t-test exported to Results/Excel/Boruta_Paired_Ttest.xlsx\n")
     print(boruta_ttest_df)
   } else {
     boruta_ttest_df <- NULL
-    cat("   ⚠ No se pudieron identificar automaticamente los 2 niveles de Boruta ('boruta'/'none'); revisar manualmente results_df$Boruta.\n")
+    cat("   Warning: could not automatically identify the 2 Boruta levels ('boruta'/'none'); check results_df$Boruta manually.\n")
   }
 
   write.xlsx(list("Complete_Ranking"=ranking,"Top_20"=head(ranking,20),
                   "Summary_By_Model"=ms,"Summary_By_Preprocessing"=ps,
                   "Summary_By_Boruta"=bs,"Cross_Table"=cr),
-             "Resultados/Excel/RMSE_Test_Ranking.xlsx",overwrite=TRUE)
-  cat("✓ Ranking exported\n")
+             "Results/Excel/RMSE_Test_Ranking.xlsx",overwrite=TRUE)
+  cat("OK Ranking exported\n")
 
   top10_plot<-ranking %>% head(10) %>%
     mutate(Combo=reorder(paste(Model,Preprocessing,Boruta,sep=" | "),-RMSE_Test)) %>%
@@ -1289,31 +1344,31 @@ if(length(results_all)>0){
     theme_minimal()+
     theme(plot.title=element_text(face="bold",hjust=0.5),
           axis.text.x=element_text(angle=45,hjust=1,size=8),legend.position="bottom")
-  ggsave("Resultados/Other/Top10_Combinations.png",top10_plot,width=14,height=8,dpi=300,bg="white")
-  cat("✓ All plots generated\n")
+  ggsave("Results/Other/Top10_Combinations.png",top10_plot,width=14,height=8,dpi=300,bg="white")
+  cat("OK All plots generated\n")
 
-}else{cat("\n✗ No results generated\n")}
+}else{cat("\nError: No results generated\n")}
 
 if(length(error_log)>0){
   write.xlsx(bind_rows(lapply(error_log,as.data.frame)),
-             "Resultados/Excel/Error_Log.xlsx",overwrite=TRUE)
-  cat("\n⚠ Errors:",length(error_log),"\n")
+             "Results/Excel/Error_Log.xlsx",overwrite=TRUE)
+  cat("\nWarning: Errors:",length(error_log),"\n")
 }
 
 # ======================================
-# 11. Resumen final
+# 11. Final summary
 # ======================================
 cat("\n",rep("=",70),"\n",sep="")
 cat("PIPELINE COMPLETED\n"); cat(rep("=",70),"\n",sep="")
 
-fin_ejecucion<-Sys.time()
-duracion<-difftime(fin_ejecucion,inicio_ejecucion,units="mins")
+end_time<-Sys.time()
+duration<-difftime(end_time,start_time,units="mins")
 
 if(length(results_all)>0){
   cat("\n EXECUTION SUMMARY:\n")
-  cat("  - Start:", format(inicio_ejecucion,"%Y-%m-%d %H:%M:%S"),"\n")
-  cat("  - End:",   format(fin_ejecucion,   "%Y-%m-%d %H:%M:%S"),"\n")
-  cat("  - Duration:",round(duracion,2),"minutes\n")
+  cat("  - Start:", format(start_time,"%Y-%m-%d %H:%M:%S"),"\n")
+  cat("  - End:",   format(end_time,   "%Y-%m-%d %H:%M:%S"),"\n")
+  cat("  - Duration:",round(duration,2),"minutes\n")
   cat("  - Samples after outlier removal:",nrow(X),"\n")
   cat("  - Outliers removed:",n_outliers,"(T2 AND Q)\n")
   cat("  - Concentration units:",CONC_UNITS,"\n")
@@ -1333,10 +1388,10 @@ cat("   Outliers/Raw_Spectra_Outliers.png\n")
 cat("   Outliers/PCA_PC1_vs_PC2.png\n")
 cat("   Outliers/PCA_PC2_vs_PC3.png\n")
 cat("   Outliers/Influence_Plot_T2_vs_Q.png\n")
-cat("   Heatmaps/Metrics_Model_Preprocessing.png  (facet: 3 filas/modelo)\n")
-cat("   Heatmaps/Metrics_Model_Boruta.png          (facet: 3 filas/modelo)\n")
-cat("   Heatmaps/Metrics_by_Model.png              (filas=modelos, cols=métricas)\n")
-cat("   Heatmaps/Metrics_by_Preprocessing.png      (filas=prep, cols=métricas)\n")
+cat("   Heatmaps/Metrics_Model_Preprocessing.png  (facet: 3 rows/model)\n")
+cat("   Heatmaps/Metrics_Model_Boruta.png          (facet: 3 rows/model)\n")
+cat("   Heatmaps/Metrics_by_Model.png              (rows=models, cols=metrics)\n")
+cat("   Heatmaps/Metrics_by_Preprocessing.png      (rows=prep., cols=metrics)\n")
 cat("   Heatmaps/RMSE_Model_Preprocessing.png\n")
 cat("   Other/Model_Comparison.png\n")
 cat("   Other/Top10_Combinations.png\n")
@@ -1348,21 +1403,21 @@ cat("   Excel/PCA_Analysis.xlsx\n")
 stopCluster(cl); registerDoSEQ()
 
 write.table(
-  data.frame(Start=format(inicio_ejecucion,"%Y-%m-%d %H:%M:%S"),
-             End  =format(fin_ejecucion,   "%Y-%m-%d %H:%M:%S"),
-             Duration_min=round(duracion,2),Samples_clean=nrow(X),
+  data.frame(Start=format(start_time,"%Y-%m-%d %H:%M:%S"),
+             End  =format(end_time,   "%Y-%m-%d %H:%M:%S"),
+             Duration_min=round(duration,2),Samples_clean=nrow(X),
              Outliers_removed=n_outliers,Criterion="T2 AND Q",
              Conc_units=CONC_UNITS,
              Combinations=ifelse(length(results_all)>0,nrow(results_df),0),
              Errors=length(error_log)),
-  "Resultados/Execution_Info.txt",row.names=FALSE,quote=FALSE)
+  "Results/Execution_Info.txt",row.names=FALSE,quote=FALSE)
 
 # ============================================================
-# SECCIÓN 12 — REPORTE PDF  /  PIPELINE REGRESIÓN  v3
-# Incluye: espectros completos + variables Boruta marcadas
-#          con líneas verticales rojas translúcidas
-# Pegar al final del pipeline, después del cat("All done!")
-# Requiere: install.packages(c("grid","gridExtra","png"))
+# PDF REPORT  /  REGRESSION PIPELINE
+# Includes: full spectra + Boruta variables marked
+#          with translucent red vertical lines
+# Runs after the main pipeline and uses its objects
+# Requires: install.packages(c("grid","gridExtra","png"))
 # ============================================================
 
 library(grid)
@@ -1371,7 +1426,7 @@ library(png)
 
 
 
-# ── PALETA ───────────────────────────────────────────────────
+# ── PALETTE ───────────────────────────────────────────────────
 COL_DARK   <- "#1a1a2e"
 COL_MID    <- "#16213e"
 COL_LIGHT  <- "#0f3460"
@@ -1385,7 +1440,7 @@ gp_caption <- gpar(fontsize =  8, fontface = "italic",col = "gray45")
 gp_mono    <- gpar(fontsize =  9, fontface = "plain", col = "gray40",
                    fontfamily = "mono")
 
-# ── HELPERS BÁSICOS ──────────────────────────────────────────
+# ── BASIC HELPERS ──────────────────────────────────────────
 insert_png <- function(path) {
   if (!file.exists(path))
     return(textGrob(paste0("[Missing: ", basename(path), "]"),
@@ -1427,16 +1482,16 @@ clean_cap <- function(fname) {
   trimws(gsub("  +", " ", gsub("_", " ", b)))
 }
 
-# ── SPECTRA PLOT CON LÍNEAS BORUTA ───────────────────────────
-# Genera un ggplot con el espectro completo (training set)
-# y superpone líneas verticales rojas translúcidas en los
-# números de onda seleccionados por Boruta.
+# ── SPECTRA PLOT WITH BORUTA LINES ───────────────────────────
+# Builds a ggplot of the full spectrum (training set)
+# and overlays translucent red vertical lines at the
+# wavenumbers selected by Boruta.
 make_spectra_boruta_plot <- function(X_matrix, wl_vec,
                                      sel_vars   = NULL,
                                      title_str  = "",
                                      y_col      = NULL) {
   
-  # Convertir matrix a long
+  # Convert matrix to long format
   Xm  <- as.matrix(X_matrix)
   nc  <- ncol(Xm); nr  <- nrow(Xm)
   wl  <- if (length(wl_vec) == nc) wl_vec else seq_len(nc)
@@ -1448,7 +1503,7 @@ make_spectra_boruta_plot <- function(X_matrix, wl_vec,
   )
   df <- df[complete.cases(df), ]
   
-  # Color de línea: si tenemos respuesta continua, usarla
+  # Line color: if a continuous response is available, use it
   use_color <- !is.null(y_col) && length(y_col) == nr
   
   p <- ggplot(df, aes(x = Wavenumber, y = Absorbance, group = Sample))
@@ -1475,9 +1530,9 @@ make_spectra_boruta_plot <- function(X_matrix, wl_vec,
           panel.border     = element_rect(color = "gray70", fill = NA),
           legend.position  = if (use_color) "right" else "none")
   
-  # Líneas verticales rojas translúcidas para variables Boruta
+  # Translucent red vertical lines for Boruta variables
   if (!is.null(sel_vars) && length(sel_vars) > 0) {
-    # Extraer números de onda numéricos
+    # Extract numeric wavenumbers
     sw <- suppressWarnings(parse_wn(sel_vars))
     sw <- sw[!is.na(sw) & sw %in% wl]
     if (length(sw) > 0) {
@@ -1486,7 +1541,7 @@ make_spectra_boruta_plot <- function(X_matrix, wl_vec,
         geom_vline(data = vl_df,
                    aes(xintercept = xintercept),
                    color     = "red",
-                   alpha     = .35,          # translúcido
+                   alpha     = .35,          # translucent
                    linewidth = .9,
                    inherit.aes = FALSE) +
         annotate("text",
@@ -1500,7 +1555,7 @@ make_spectra_boruta_plot <- function(X_matrix, wl_vec,
   p
 }
 
-# Guarda el plot como PNG temporal y devuelve el grob
+# Saves the plot as a temporary PNG and returns the grob
 spectra_grob <- function(X_matrix, wl_vec, sel_vars = NULL,
                          title_str = "", y_col = NULL) {
   tmp <- tempfile(fileext = ".png")
@@ -1512,7 +1567,7 @@ spectra_grob <- function(X_matrix, wl_vec, sel_vars = NULL,
   insert_png(tmp)
 }
 
-# ── DIAGRAMAS CONCEPTUALES ───────────────────────────────────
+# ── CONCEPTUAL DIAGRAMS ───────────────────────────────────────
 box_r <- function(x, y, w=.14, h=.055, fill=COL_ACCENT, label="", sz=8.5) {
   grid.roundrect(x=unit(x,"npc"),y=unit(y,"npc"),
                  width=unit(w,"npc"),height=unit(h,"npc"),r=unit(4,"pt"),
@@ -1641,20 +1696,20 @@ draw_diagram_xgb <- function(vp) {
 }
 
 # ══════════════════════════════════════════════════════════════
-# GUARDAR ESPECTROS CON BORUTA SOBRE ESPECTRO CRUDO
-# Solo se genera UN PNG por preprocessing: espectro original
-# (post-outlier, sin ningún preprocesamiento) con líneas rojas
-# translúcidas en los números de onda confirmados por Boruta.
-# Se generan ANTES de abrir el PDF para no mezclar devices.
+# SAVE BORUTA SPECTRA OVER THE RAW SPECTRUM
+# Only ONE PNG is generated per preprocessing: the original spectrum
+# (post-outlier removal, without any preprocessing) with translucent red
+# lines at the wavenumbers confirmed by Boruta.
+# Generated BEFORE opening the PDF so that graphics devices are not mixed.
 # ══════════════════════════════════════════════════════════════
 cat(">>> Generating Boruta spectra overlay plots (raw spectra)...\n")
-dir.create("Resultados/Spectra/Boruta_Overlays", showWarnings=FALSE, recursive=TRUE)
+dir.create("Results/Spectra/Boruta_Overlays", showWarnings=FALSE, recursive=TRUE)
 
 if (!exists("boruta_vars_log")) boruta_vars_log <- list()
 y_col_train <- if(exists("y_train")) as.numeric(y_train) else NULL
 
-# Espectro crudo completo — overview sin marcas (portada de la sección)
-raw_spectra_grob_path <- "Resultados/Spectra/Boruta_Overlays/_raw_all_samples.png"
+# Complete raw spectrum — overview without marks (section cover)
+raw_spectra_grob_path <- "Results/Spectra/Boruta_Overlays/_raw_all_samples.png"
 if (exists("X_train") && exists("wavelengths")) {
   p_raw_all <- make_spectra_boruta_plot(
     X_matrix  = X_train,
@@ -1666,20 +1721,19 @@ if (exists("X_train") && exists("wavelengths")) {
   )
   tryCatch(ggsave(raw_spectra_grob_path, p_raw_all, width=12, height=5, dpi=150,bg="white"),
            error=function(e) NULL)
-  cat("   ✓ Raw overview saved\n")
+  cat("   OK Raw overview saved\n")
 }
 
-# Un PNG por preprocessing: espectro CRUDO + líneas Boruta
+# One PNG per preprocessing: RAW spectrum + Boruta lines
 boruta_png_map <- list()
 
 for (sc in scatter_opts) {
   for (dv in deriv_opts) {
-    pp_name_local <- trimws(gsub(" +"," ", paste(
-      "SG", ifelse(sc=="none","",sc), ifelse(dv==0,"",paste0("+",dv,"der")))))
+    pp_name_local <- make_pp_name(sc, dv)
     
     bor_key <- paste(pp_name_local, "boruta", sep="__")
     
-    # Variables confirmadas por Boruta para este preprocessing
+    # Variables confirmed by Boruta for this preprocessing
     sel_vars_local <- NULL
     if (bor_key %in% names(boruta_vars_log)) {
       bvl <- boruta_vars_log[[bor_key]]
@@ -1687,8 +1741,8 @@ for (sc in scatter_opts) {
         sel_vars_local <- trimws(strsplit(bvl$Variables, ",")[[1]])
     }
     
-    # PNG: espectro crudo (X_train) + líneas rojas en posiciones Boruta
-    path_raw_bor <- paste0("Resultados/Spectra/Boruta_Overlays/",
+    # PNG: raw spectrum (X_train) + red lines at the Boruta positions
+    path_raw_bor <- paste0("Results/Spectra/Boruta_Overlays/",
                            gsub(" ","_", pp_name_local), "_raw_boruta.png")
     
     p_raw_bor <- make_spectra_boruta_plot(
@@ -1705,7 +1759,7 @@ for (sc in scatter_opts) {
       raw_boruta = path_raw_bor,
       n_vars     = if(!is.null(sel_vars_local)) length(sel_vars_local) else NA
     )
-    cat("   ✓", pp_name_local,
+    cat("   OK", pp_name_local,
         if(!is.null(sel_vars_local)) paste0("(", length(sel_vars_local), " vars)") else "(all vars)",
         "\n")
   }
@@ -1713,14 +1767,14 @@ for (sc in scatter_opts) {
 cat(">>> Done.\n\n")
 
 # ══════════════════════════════════════════════════════════════
-# ABRIR PDF
+# OPEN PDF
 # ══════════════════════════════════════════════════════════════
-pdf_path <- "Resultados/Scan_Regression_Report.pdf"
+pdf_path <- "Results/Scan_Regression_Report.pdf"
 pdf(pdf_path, width=11, height=8.5, paper="USr")
 pg <- 0L
 
 # ══════════════════════════════════════════════════════════════
-# P1 — CARÁTULA
+# P1 — COVER PAGE
 # ══════════════════════════════════════════════════════════════
 grid.newpage(); pg <- pg + 1L
 grid.rect(x=0,y=1,width=1,height=.52,just=c("left","top"),
@@ -1743,7 +1797,7 @@ grid.text("Study Information",x=unit(.32,"npc"),y=unit(.436,"npc"),
           gp=gpar(fontsize=10,fontface="bold",col="white"))
 
 REPORT_MATRIX     <- ""
-REPORT_ANALYTE    <- sheet_name   # se completa solo con la hoja analizada
+REPORT_ANALYTE    <- sheet_name   # filled in automatically with the analyzed sheet
 REPORT_INSTRUMENT <- ""
 REPORT_N_SAMPLES  <- if(exists("X_raw")) as.character(nrow(X_raw)) else ""
 
@@ -1804,7 +1858,7 @@ for(e in toc){
 draw_page_number(pg)
 
 # ══════════════════════════════════════════════════════════════
-# P3 — OUTLIERS texto
+# P3 — OUTLIERS text
 # ══════════════════════════════════════════════════════════════
 grid.newpage(); pg <- pg + 1L
 draw_section_bar("1. Outlier Detection & Removal")
@@ -1834,7 +1888,7 @@ grid.text(
   x=.5,y=y_cur-.052,
   gp=gpar(fontsize=9.5,fontface="bold",col=COL_MID))
 
-grid.draw(editGrob(insert_png("Resultados/Outliers/Raw_Spectra_Outliers.png"),
+grid.draw(editGrob(insert_png("Results/Outliers/Raw_Spectra_Outliers.png"),
                    vp=viewport(x=.5,y=.285,width=.90,height=.41)))
 grid.text("Figure 1. Raw FTMIR spectra. Blue = retained; Red = outliers.",
           x=.5,y=.065,gp=gp_caption)
@@ -1843,14 +1897,14 @@ draw_page_number(pg)
 # P4 PCA plots
 grid.newpage(); pg <- pg + 1L
 draw_section_bar("1. Outlier Detection & Removal (cont.)")
-grid.draw(editGrob(insert_png("Resultados/Outliers/PCA_PC1_vs_PC2.png"),
+grid.draw(editGrob(insert_png("Results/Outliers/PCA_PC1_vs_PC2.png"),
                    vp=viewport(x=.25,y=.67,width=.46,height=.44)))
-grid.draw(editGrob(insert_png("Resultados/Outliers/PCA_PC2_vs_PC3.png"),
+grid.draw(editGrob(insert_png("Results/Outliers/PCA_PC2_vs_PC3.png"),
                    vp=viewport(x=.75,y=.67,width=.46,height=.44)))
 grid.text("Figure 2. PCA PC1 vs PC2.",x=.25,y=.44,gp=gp_caption)
 grid.text("Figure 3. PCA PC2 vs PC3.",x=.75,y=.44,gp=gp_caption)
 hrule(.425)
-grid.draw(editGrob(insert_png("Resultados/Outliers/Influence_Plot_T2_vs_Q.png"),
+grid.draw(editGrob(insert_png("Results/Outliers/Influence_Plot_T2_vs_Q.png"),
                    vp=viewport(x=.5,y=.245,width=.55,height=.36)))
 grid.text("Figure 4. Influence plot: T\u00b2 vs Q residuals. Dashed lines = thresholds.",
           x=.5,y=.055,gp=gp_caption)
@@ -1865,8 +1919,13 @@ draw_section_bar("2. Spectral Preprocessing Methods")
 preproc_items <- list(
   list(name="Mean Centering  (applied to all combinations)",
        desc="Each spectral variable centered by subtracting the training-set column mean. Same mean applied to test set to prevent data leakage. Prerequisite for PLS and regularized methods."),
-  list(name="Savitzky-Golay Derivatives  (0th, 1st, 2nd | poly=3, window=11)",
-       desc="SG smoothing applied before scatter correction. 0th derivative: smoothed spectrum. 1st: removes additive baseline offsets. 2nd: removes constant and linear baselines, enhances spectral resolution."),
+  list(name="Savitzky-Golay smoothing / derivatives  (0th, 1st, 2nd | poly=3, window=11)",
+       desc=paste0("Computed on the complete, continuous spectrum (545 variables) before the Patz windows are cropped. ",
+                   "0th = smoothed spectrum", if (SMOOTH_ALWAYS) " (applied to every combination, including those without derivative). " else " (NOT applied in this run: combinations without derivative are raw spectra). ",
+                   "1st derivative removes additive baseline offsets. ",
+                   "2nd derivative removes constant and linear baselines, enhances spectral resolution. ",
+                   if (SCATTER_FIRST) "Order of operations: scatter correction (SNV/MSC) -> Savitzky-Golay -> Patz windows -> mean centering."
+                   else "Order of operations: Savitzky-Golay -> scatter correction (SNV/MSC) -> Patz windows -> mean centering.")),
   list(name="Standard Normal Variate (SNV)",
        desc="Each spectrum scaled to zero mean and unit variance independently, correcting multiplicative scatter and path-length differences. Applied sample-wise; no reference spectrum required."),
   list(name="Multiplicative Scatter Correction (MSC)",
@@ -1922,7 +1981,7 @@ grid.draw(editGrob(tbl_s,
 draw_page_number(pg)
 
 # ══════════════════════════════════════════════════════════════
-# SECCIÓN 4 — ALGORITMOS (una página cada uno con diagrama)
+# SECTION 4 — ALGORITHMS (one page each, with diagram)
 # ══════════════════════════════════════════════════════════════
 algo_list <- list(
   list(name="Partial Least Squares (PLS)", caret="method = 'pls'",
@@ -2022,7 +2081,7 @@ for(al in algo_list){
   draw_page_number(pg)
 }
 
-# ── Tabla resumen de hiperparámetros (página única) ───────────
+# ── Hyperparameter summary table (single page) ───────────
 grid.newpage(); pg <- pg + 1L
 draw_section_bar("4. Hyperparameter Summary — All Models")
 
@@ -2098,7 +2157,7 @@ tbl_hs <- tableGrob(hyper_summary, rows=NULL,
 grid.draw(editGrob(tbl_hs,
                    vp=viewport(x=.5, y=.45, width=.94, height=.62)))
 
-# Leyenda de colores
+# Color legend
 leg_x <- .08
 for(mn in names(model_fills)){
   grid.rect(x=unit(leg_x,"npc"), y=unit(.07,"npc"),
@@ -2147,7 +2206,7 @@ if(length(boruta_vars_log)>0){
 }
 draw_page_number(pg)
 
-# ── Páginas de listas de variables Boruta ────────────────────
+# ── Boruta variable list pages ────────────────────────────
 if(length(boruta_vars_log)>0){
   chunks<-split(boruta_vars_log,ceiling(seq_along(boruta_vars_log)/7))
   for(ck in seq_along(chunks)){
@@ -2179,13 +2238,13 @@ if(length(boruta_vars_log)>0){
 }
 
 # ══════════════════════════════════════════════════════════════
-# SECCIÓN 6 — ESPECTROS CRUDOS CON VARIABLES BORUTA MARCADAS
-# Una página por preprocessing: siempre sobre el espectro original
-# (post-outlier, sin ninguna transformación matemática)
+# SECTION 6 — RAW SPECTRA WITH BORUTA VARIABLES MARKED
+# One page per preprocessing: always on the original spectrum
+# (post-outlier removal, without any mathematical transformation)
 # ══════════════════════════════════════════════════════════════
 if(length(boruta_png_map)>0){
   
-  # Página de introducción
+  # Introduction page
   grid.newpage(); pg<-pg+1L
   draw_section_bar("6. Boruta Variable Selection — Highlighted on Raw Spectra")
   
@@ -2204,7 +2263,7 @@ if(length(boruta_png_map)>0){
     "which preprocessing was used, enabling direct cross-comparison between combinations."),
     y=.74)
   
-  # Recuadro interpretativo
+  # Interpretation box
   grid.rect(x=unit(.05,"npc"), y=unit(.26,"npc"),
             width=unit(.90,"npc"), height=unit(.27,"npc"),
             just=c("left","bottom"),
@@ -2227,7 +2286,7 @@ if(length(boruta_png_map)>0){
               gp=gpar(fontsize=9, col="#333333"))
   draw_page_number(pg)
   
-  # Página de espectro crudo completo (sin marcas — overview)
+  # Complete raw spectrum page (no marks — overview)
   grid.newpage(); pg<-pg+1L
   draw_section_bar("6. Raw Spectra Overview (no Boruta marks)")
   if(file.exists(raw_spectra_grob_path)){
@@ -2241,7 +2300,7 @@ if(length(boruta_png_map)>0){
   }
   draw_page_number(pg)
   
-  # Una página por preprocessing: espectro crudo + líneas Boruta
+  # One page per preprocessing: raw spectrum + Boruta lines
   fig_n <- 20L
   for(pp_nm in names(boruta_png_map)){
     grid.newpage(); pg<-pg+1L; fig_n<-fig_n+1L
@@ -2264,7 +2323,7 @@ if(length(boruta_png_map)>0){
 }
 
 # ══════════════════════════════════════════════════════════════
-# SECCIÓN 8 — RESULTS TABLES
+# RESULTS TABLES
 # ══════════════════════════════════════════════════════════════
 if(exists("results_df") && nrow(results_df)>0){
   
@@ -2306,7 +2365,7 @@ if(exists("results_df") && nrow(results_df)>0){
                                          colhead=list(fg_params=list(fontface="bold",col=COL_MID))))
   grid.draw(editGrob(tbl_ms,vp=viewport(x=.5,y=.77,width=.88,height=.28)))
   hrule(.61)
-  grid.draw(editGrob(insert_png("Resultados/Other/Top10_Combinations.png"),
+  grid.draw(editGrob(insert_png("Results/Other/Top10_Combinations.png"),
                      vp=viewport(x=.5,y=.355,width=.90,height=.44)))
   grid.text("Figure. Top 10 combinations ranked by RMSE Test (ascending).",
             x=.5,y=.065,gp=gp_caption)
@@ -2314,22 +2373,22 @@ if(exists("results_df") && nrow(results_df)>0){
 }
 
 # ══════════════════════════════════════════════════════════════
-# SECCIÓN 9 — HEATMAPS
+# HEATMAPS
 # ══════════════════════════════════════════════════════════════
 hm_list<-list(
-  list(f="Resultados/Heatmaps/Metrics_Model_Preprocessing.png",
+  list(f="Results/Heatmaps/Metrics_Model_Preprocessing.png",
        c="Figure. R\u00b2, RMSE, RPD by Model vs Preprocessing (mean across Boruta options)."),
-  list(f="Resultados/Heatmaps/Metrics_Model_Boruta.png",
+  list(f="Results/Heatmaps/Metrics_Model_Boruta.png",
        c="Figure. Metrics by Model vs Preprocessing + Boruta configuration."),
-  list(f="Resultados/Heatmaps/Metrics_by_Model.png",
+  list(f="Results/Heatmaps/Metrics_by_Model.png",
        c="Figure. Average performance metrics aggregated by model."),
-  list(f="Resultados/Heatmaps/Metrics_by_Preprocessing.png",
+  list(f="Results/Heatmaps/Metrics_by_Preprocessing.png",
        c="Figure. Average performance metrics aggregated by preprocessing method."),
-  list(f="Resultados/Heatmaps/RMSE_Model_Preprocessing.png",
+  list(f="Results/Heatmaps/RMSE_Model_Preprocessing.png",
        c="Figure. RMSE Test heatmap: Model vs Preprocessing. Green = lowest (best); Red = highest."),
-  list(f="Resultados/Other/Model_Comparison.png",
+  list(f="Results/Other/Model_Comparison.png",
        c="Figure. R\u00b2 Test by model and preprocessing. Points = individual combinations; bar = median."),
-  list(f="Resultados/Other/PCA_Metrics.png",
+  list(f="Results/Other/PCA_Metrics.png",
        c="Figure. PCA of performance metrics (R\u00b2, RMSE, RPD) from training and test sets.")
 )
 for(hm in hm_list){
@@ -2342,10 +2401,10 @@ for(hm in hm_list){
 }
 
 # ══════════════════════════════════════════════════════════════
-# SECCIÓN 10 — SCATTER PLOTS (2×2 por página)
+# SCATTER PLOTS (2×2 per page)
 # ══════════════════════════════════════════════════════════════
 for(m_name in c(names(models),"XGB")){
-  scatter_dir<-paste0("Resultados/ScatterPlots/",m_name)
+  scatter_dir<-paste0("Results/ScatterPlots/",m_name)
   if(!dir.exists(scatter_dir)) next
   png_files<-list.files(scatter_dir,pattern="\\.png$",full.names=TRUE)
   if(length(png_files)==0) next
@@ -2397,26 +2456,47 @@ for(m_name in c(names(models),"XGB")){
 }
 
 # ══════════════════════════════════════════════════════════════
-# CERRAR PDF
+# CLOSE PDF
 # ══════════════════════════════════════════════════════════════
 dev.off()
 cat("\n",rep("=",60),"\n",sep="")
-cat("  REGRESSION PDF REPORT GENERATED — v3\n")
+cat("  REGRESSION PDF REPORT GENERATED\n")
 cat("  Path:  ",pdf_path,"\n",sep="")
 cat("  Pages: ",pg,"\n",sep="")
 cat(rep("=",60),"\n\n",sep="")
 
 # ══════════════════════════════════════════════════════════════
-# Renombrar la carpeta de resultados con el nombre de la hoja
-# analizada (ej. "Resultados" -> "Resultados_POTASIO"), para no
-# pisar los resultados de otro analito en la proxima corrida.
+# Rename the results folder with the name of the analyzed
+# sheet (e.g. "Results" -> "Results_POTASSIUM"), so that the
+# results of another analyte are not overwritten in the next run.
 # ══════════════════════════════════════════════════════════════
-results_root <- paste0("Resultados_", sheet_name)
+results_root <- paste0("Results_", sheet_name)
 if (dir.exists(results_root)) {
-  cat(">>> '",results_root,"' ya existia (corrida previa de este mismo analito) - se sobreescribe.\n",sep="")
+  cat(">>> '",results_root,"' already existed (previous run for this same analyte) - overwriting.\n",sep="")
   unlink(results_root, recursive = TRUE)
 }
-if (dir.exists("Resultados")) {
-  file.rename("Resultados", results_root)
-  cat(">>> Carpeta de resultados renombrada a: ",results_root,"\n",sep="")
+if (dir.exists("Results")) {
+  file.rename("Results", results_root)
+  cat(">>> Results folder renamed to: ",results_root,"\n",sep="")
+}
+
+# ══════════════════════════════════════════════════════════════
+# Append the analyte name to ALL generated files
+# (e.g. "Boruta_Paired_Ttest.xlsx" -> "Boruta_Paired_Ttest_POTASSIUM.xlsx").
+# This is automatic: the suffix comes from the name of the analyzed sheet (sheet_name).
+# It is done at the end, once all files are closed, so as not to interfere
+# with the rest of the pipeline (plots and the PDF are generated with the
+# original names and only renamed afterwards).
+# ══════════════════════════════════════════════════════════════
+if (dir.exists(results_root)) {
+  tag   <- gsub("[^A-Za-z0-9]+", "_", sheet_name)
+  files <- list.files(results_root, recursive = TRUE, full.names = TRUE, include.dirs = FALSE)
+  base  <- basename(files)
+  todo  <- grepl("\\.[^.]+$", base) & !grepl(paste0("_", tag, "\\.[^.]+$"), base)
+  new   <- file.path(dirname(files), sub("(\\.[^.]+)$", paste0("_", tag, "\\1"), base))
+  ok    <- rep(FALSE, length(files))
+  if (any(todo)) ok[todo] <- file.rename(files[todo], new[todo])
+  cat(">>> Files renamed with suffix '_", tag, "': ", sum(ok), " of ", sum(todo), "\n", sep = "")
+  if (sum(ok) < sum(todo))
+    cat("    (files that could not be renamed are usually open in another program, e.g. Excel or a PDF viewer)\n")
 }
