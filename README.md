@@ -146,7 +146,8 @@ The results come from a single training/test partition (`set.seed(1234)`).
 
 ## Versions
 
-The version described here (1.1.0) supersedes 1.0.1 (DOI 10.5281/zenodo.23033275).
+The version described here (1.1.0, DOI [10.5281/zenodo.23199425](https://doi.org/10.5281/zenodo.23199425))
+supersedes 1.0.1 (DOI 10.5281/zenodo.23033275).
 Changes with respect to 1.0.1: scatter correction (SNV/MSC) is now applied before the
 Savitzky–Golay filter, all preprocessing conditions include smoothing (SG0 = smoothing
 only), the positive class in classification is the class above the limit, and all
@@ -156,13 +157,14 @@ The R version used to obtain the results was 4.3.1 (caret 6.0-94). Running
 `sessionInfo()` at the end of a pipeline run records the exact package versions
 of the local installation.
 
+## Web app
+
+The winning model of each analyte is available as a web application
+(WineMetalScan): <https://github.com/pablofacu86/WineMetalScan>. The deployed models
+were rebuilt from `data/FINAL_DATA_SET.xlsx` with the same
+preprocessing and hyperparameters reported in the article.
+
 ## Citation
 
-If you use this code or data, please cite:
-
-> [Full citation of the article to be added once published.]
-
-## License
-
-[License to be defined by the authors — e.g. MIT for the code, CC-BY for the
-data.]
+If you use this code or data, please cite the archived version of this repository:
+https://doi.org/10.5281/zenodo.23199425
